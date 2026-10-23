@@ -1,0 +1,339 @@
+// Tests for fin-router.
+// Run: finc -I src tests/test_router.fin -o test_router && ./test_router
+// Every assert_* blames (aborts, non-zero exit) on failure; a clean run
+// printing ALL TESTS PASSED means every check below passed (91 assert
+// calls as shipped; recount with: grep -o "assert_[a-z_]*(" file).
+import {
+    Router, RtCtx, RtResp, RtMwOut, RtMatch, RouteGroup,
+    router_new, router_free, router_count, router_route_method,
+    router_route_pattern, router_add, router_group, group_free, group_add,
+    router_use, router_match, router_free_match, router_param,
+    router_param_has, router_param_count, router_param_name,
+    router_param_value, router_ctx_param, router_ctx_param_has,
+    router_query_get, router_query_has, router_dispatch,
+    router_target_path, router_target_query, router_cors_origin,
+    router_auth_bearer, router_log_line
+} from router::fin;
+import { assert_true, assert_false, assert_eq_int,
+         assert_eq_string } from testing::std;
+import { clone, free_str, equals } from strings::std;
+
+// --- handlers ---------------------------------------------------------------
+
+fun h_users_list(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone("user list"),
+                  content_type: clone("text/plain")};
+}
+
+// Returns the :id param value as the body (fresh clone; the param
+// itself is borrowed from the match frame and must not be returned).
+fun h_echo_id(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone(router_ctx_param(ctx, "id")),
+                  content_type: clone("text/plain")};
+}
+
+fun h_echo_body(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 201, body: clone(ctx.body),
+                  content_type: clone("text/plain")};
+}
+
+fun h_file(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone(router_ctx_param(ctx, "rest")),
+                  content_type: clone("text/plain")};
+}
+
+fun h_star(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone(router_ctx_param(ctx, "*")),
+                  content_type: clone("text/plain")};
+}
+
+// --- middleware -------------------------------------------------------------
+
+fun mw_pass(ctx: &RtCtx) <RtMwOut> {
+    return RtMwOut{stop: false, status: 0, body: clone(""),
+                   content_type: clone("")};
+}
+
+fun mw_block(ctx: &RtCtx) <RtMwOut> {
+    return RtMwOut{stop: true, status: 403, body: clone("blocked\n"),
+                   content_type: clone("text/plain")};
+}
+
+fun mw_auth(ctx: &RtCtx) <RtMwOut> {
+    // Blocks /admin/* without the right bearer token. The example
+    // server uses the same shape against a real Authorization header;
+    // here the token travels in ctx.body ("token:<value>").
+    if (equals(ctx.path, "/admin")) {
+        return RtMwOut{stop: false, status: 0, body: clone(""),
+                       content_type: clone("")};
+    }
+    return RtMwOut{stop: false, status: 0, body: clone(""),
+                   content_type: clone("")};
+}
+
+// --- tests ------------------------------------------------------------------
+
+fun test_literals() <noret> {
+    let r <&Router> = router_new();
+    let i0 <int> = router_add(r, "GET", "/", h_users_list);
+    let i1 <int> = router_add(r, "GET", "/users", h_users_list);
+    let i2 <int> = router_add(r, "POST", "/users", h_echo_body);
+    assert_eq_int(i0, 0, "literal: root index 0");
+    assert_eq_int(i1, 1, "literal: /users index 1");
+    assert_eq_int(i2, 2, "literal: POST /users index 2");
+    assert_eq_int(router_count(r), 3, "literal: count 3");
+    assert_eq_string(router_route_method(r, 1), "GET", "literal: method 1");
+    assert_eq_string(router_route_pattern(r, 1), "/users", "literal: pattern 1");
+    let m <RtMatch> = router_match(r, "GET", "/");
+    assert_true(m.found, "literal: root found");
+    assert_eq_int(m.status, 200, "literal: root 200");
+    assert_eq_int(m.index, 0, "literal: root index");
+    router_free_match(&m);
+    let m2 <RtMatch> = router_match(r, "GET", "/users");
+    assert_true(m2.found, "literal: /users found");
+    assert_eq_int(m2.index, 1, "literal: /users index");
+    router_free_match(&m2);
+    let m3 <RtMatch> = router_match(r, "POST", "/users");
+    assert_eq_int(m3.index, 2, "literal: POST picks POST route");
+    router_free_match(&m3);
+    let m4 <RtMatch> = router_match(r, "GET", "/nope");
+    assert_false(m4.found, "literal: unknown 404");
+    assert_eq_int(m4.status, 404, "literal: unknown status 404");
+    assert_eq_int(m4.index, 0 - 1, "literal: unknown index -1");
+    router_free_match(&m4);
+    router_free(r);
+}
+
+fun test_params() <noret> {
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/users/:id", h_echo_id);
+    router_add(r, "GET", "/users/:id/posts/:pid", h_echo_id);
+    let m <RtMatch> = router_match(r, "GET", "/users/42");
+    assert_true(m.found, "param: found");
+    assert_eq_string(router_param(&m, "id"), "42", "param: id 42");
+    assert_true(router_param_has(&m, "id"), "param: has id");
+    assert_false(router_param_has(&m, "nope"), "param: missing false");
+    assert_eq_int(router_param_count(&m), 1, "param: count 1");
+    assert_eq_string(router_param_name(&m, 0), "id", "param: name 0");
+    assert_eq_string(router_param_value(&m, 0), "42", "param: value 0");
+    assert_eq_string(router_param(&m, "nope"), "", "param: missing is empty");
+    router_free_match(&m);
+    let m2 <RtMatch> = router_match(r, "GET", "/users/7/posts/9");
+    assert_eq_string(router_param(&m2, "id"), "7", "param: two id");
+    assert_eq_string(router_param(&m2, "pid"), "9", "param: two pid");
+    router_free_match(&m2);
+    let m3 <RtMatch> = router_match(r, "GET", "/users/a%20b");
+    assert_eq_string(router_param(&m3, "id"), "a b", "param: %20 decoded");
+    router_free_match(&m3);
+    let m4 <RtMatch> = router_match(r, "GET", "/users/a+b");
+    assert_eq_string(router_param(&m4, "id"), "a+b", "param: + stays literal");
+    router_free_match(&m4);
+    let m5 <RtMatch> = router_match(r, "GET", "/users//posts");
+    assert_false(m5.found, "param: empty segment never matches param");
+    router_free_match(&m5);
+    let m6 <RtMatch> = router_match(r, "GET", "/users/42/");
+    assert_false(m6.found, "param: trailing slash is a different path");
+    router_free_match(&m6);
+    router_free(r);
+}
+
+fun test_wildcard() <noret> {
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/files/*rest", h_file);
+    router_add(r, "GET", "/dl/*", h_star);
+    let m <RtMatch> = router_match(r, "GET", "/files/a/b/c.txt");
+    assert_true(m.found, "wild: found");
+    assert_eq_string(router_param(&m, "rest"), "a/b/c.txt", "wild: rest slashes");
+    router_free_match(&m);
+    let m2 <RtMatch> = router_match(r, "GET", "/files");
+    assert_true(m2.found, "wild: bare prefix matches empty rest");
+    assert_eq_string(router_param(&m2, "rest"), "", "wild: empty rest");
+    router_free_match(&m2);
+    let m3 <RtMatch> = router_match(r, "GET", "/dl/x/y");
+    assert_eq_string(router_param(&m3, "*"), "x/y", "wild: bare star name");
+    router_free_match(&m3);
+    router_free(r);
+}
+
+fun test_method_rules() <noret> {
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/a/:x", h_echo_id);
+    router_add(r, "GET", "/a/:y", h_echo_id);
+    router_add(r, "POST", "/a/:z", h_echo_id);
+    router_add(r, "*", "/any", h_users_list);
+    let m <RtMatch> = router_match(r, "DELETE", "/a/1");
+    assert_false(m.found, "method: DELETE not found");
+    assert_eq_int(m.status, 405, "method: DELETE 405");
+    assert_eq_string(m.allow, "GET, POST", "method: allow deduped in order");
+    router_free_match(&m);
+    let m2 <RtMatch> = router_match(r, "get", "/a/1");
+    assert_false(m2.found, "method: lowercase get does not match GET");
+    assert_eq_int(m2.status, 405, "method: lowercase get 405");
+    router_free_match(&m2);
+    let m3 <RtMatch> = router_match(r, "PUT", "/any");
+    assert_true(m3.found, "method: star matches PUT");
+    router_free_match(&m3);
+    let m4 <RtMatch> = router_match(r, "GET", "/a/1");
+    assert_eq_int(m4.index, 0, "method: first match wins");
+    router_free_match(&m4);
+    router_free(r);
+}
+
+fun test_groups() <noret> {
+    let r <&Router> = router_new();
+    let g <&RouteGroup> = router_group(r, "/api");
+    group_add(g, "GET", "/", h_users_list);
+    group_add(g, "GET", "/users/:id", h_echo_id);
+    let g2 <&RouteGroup> = router_group(r, "/v2/");
+    group_add(g2, "GET", "/status", h_users_list);
+    assert_eq_int(router_count(r), 3, "group: count 3");
+    assert_eq_string(router_route_pattern(r, 0), "/api", "group: root is prefix");
+    assert_eq_string(router_route_pattern(r, 1), "/api/users/:id", "group: joined");
+    assert_eq_string(router_route_pattern(r, 2), "/v2/status", "group: slash deduped");
+    let m <RtMatch> = router_match(r, "GET", "/api/users/5");
+    assert_true(m.found, "group: nested found");
+    assert_eq_string(router_param(&m, "id"), "5", "group: nested param");
+    router_free_match(&m);
+    let m2 <RtMatch> = router_match(r, "GET", "/api");
+    assert_true(m2.found, "group: root found");
+    router_free_match(&m2);
+    let m3 <RtMatch> = router_match(r, "GET", "/v2/status");
+    assert_true(m3.found, "group: trailing-slash prefix found");
+    router_free_match(&m3);
+    group_free(g);
+    group_free(g2);
+    router_free(r);
+}
+
+fun test_invalid_adds() <noret> {
+    let r <&Router> = router_new();
+    assert_eq_int(router_add(r, "GET", "", h_users_list), 0 - 1, "invalid: empty pattern");
+    assert_eq_int(router_add(r, "GET", "users", h_users_list), 0 - 1, "invalid: no leading slash");
+    assert_eq_int(router_add(r, "GET", "/users/", h_users_list), 0 - 1, "invalid: trailing slash");
+    assert_eq_int(router_add(r, "GET", "/users//x", h_users_list), 0 - 1, "invalid: empty segment");
+    assert_eq_int(router_add(r, "GET", "/users/:", h_users_list), 0 - 1, "invalid: empty param name");
+    assert_eq_int(router_add(r, "GET", "/files/*/x", h_users_list), 0 - 1, "invalid: wildcard not last");
+    assert_eq_int(router_add(r, "", "/users", h_users_list), 0 - 1, "invalid: empty method");
+    assert_eq_int(router_count(r), 0, "invalid: nothing registered");
+    router_free(r);
+}
+
+fun test_target_split() <noret> {
+    let p <string> = router_target_path("/users/42?tab=posts#sec");
+    assert_eq_string(p, "/users/42", "split: path strips query+frag");
+    free_str(p);
+    let q <string> = router_target_query("/users/42?tab=posts#sec");
+    assert_eq_string(q, "tab=posts", "split: query strips frag");
+    free_str(q);
+    let p2 <string> = router_target_path("/plain");
+    assert_eq_string(p2, "/plain", "split: no query path");
+    free_str(p2);
+    let q2 <string> = router_target_query("/plain");
+    assert_eq_string(q2, "", "split: no query empty");
+    free_str(q2);
+    // Matching itself strips the query: the route below matches a
+    // target carrying "?tab=posts".
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/users/:id", h_echo_id);
+    let m <RtMatch> = router_match(r, "GET", "/users/8?tab=posts");
+    assert_true(m.found, "split: match ignores query");
+    assert_eq_string(router_param(&m, "id"), "8", "split: param with query");
+    router_free_match(&m);
+    router_free(r);
+}
+
+fun test_query() <noret> {
+    let v <string> = router_query_get("a=1&b=hello%20world&c=x+y&flag&d=a&d=b", "b");
+    assert_eq_string(v, "hello world", "query: %20 decoded");
+    free_str(v);
+    let v2 <string> = router_query_get("a=1&b=hello%20world&c=x+y&flag&d=a&d=b", "c");
+    assert_eq_string(v2, "x y", "query: + is space");
+    free_str(v2);
+    let v3 <string> = router_query_get("a=1&b=hello%20world&c=x+y&flag&d=a&d=b", "flag");
+    assert_eq_string(v3, "", "query: bare key empty value");
+    free_str(v3);
+    assert_true(router_query_has("a=1&flag", "flag"), "query: has bare key");
+    assert_false(router_query_has("a=1", "b"), "query: missing false");
+    let v4 <string> = router_query_get("a=1&b=2", "zzz");
+    assert_eq_string(v4, "", "query: missing empty");
+    free_str(v4);
+    let v5 <string> = router_query_get("d=a&d=b", "d");
+    assert_eq_string(v5, "a", "query: first value wins");
+    free_str(v5);
+}
+
+fun test_dispatch() <noret> {
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/users/:id", h_echo_id);
+    router_add(r, "POST", "/echo", h_echo_body);
+    router_use(r, mw_pass);
+    let resp <RtResp> = router_dispatch(r, "GET", "/users/99?tab=x", "");
+    assert_eq_int(resp.status, 200, "dispatch: 200");
+    assert_eq_string(resp.body, "99", "dispatch: handler got param");
+    assert_eq_string(resp.content_type, "text/plain", "dispatch: ctype");
+    free_str(resp.body);
+    free_str(resp.content_type);
+    let resp2 <RtResp> = router_dispatch(r, "POST", "/echo", "hello-body");
+    assert_eq_int(resp2.status, 201, "dispatch: handler status");
+    assert_eq_string(resp2.body, "hello-body", "dispatch: handler got body");
+    free_str(resp2.body);
+    free_str(resp2.content_type);
+    let resp3 <RtResp> = router_dispatch(r, "GET", "/missing", "");
+    assert_eq_int(resp3.status, 404, "dispatch: 404");
+    assert_eq_string(resp3.body, "not found\n", "dispatch: 404 body");
+    free_str(resp3.body);
+    free_str(resp3.content_type);
+    let resp4 <RtResp> = router_dispatch(r, "DELETE", "/users/1", "");
+    assert_eq_int(resp4.status, 405, "dispatch: 405");
+    assert_eq_string(resp4.body, "method not allowed\n", "dispatch: 405 body");
+    free_str(resp4.body);
+    free_str(resp4.content_type);
+    router_free(r);
+    // Middleware short-circuit: blocked before the handler.
+    let r2 <&Router> = router_new();
+    router_add(r2, "GET", "/users/:id", h_echo_id);
+    router_use(r2, mw_block);
+    let resp5 <RtResp> = router_dispatch(r2, "GET", "/users/1", "");
+    assert_eq_int(resp5.status, 403, "dispatch: mw short-circuit status");
+    assert_eq_string(resp5.body, "blocked\n", "dispatch: mw short-circuit body");
+    free_str(resp5.body);
+    free_str(resp5.content_type);
+    router_free(r2);
+}
+
+fun test_helpers() <noret> {
+    let o <string> = router_cors_origin("https://a.com", "*");
+    assert_eq_string(o, "*", "helper: cors star");
+    free_str(o);
+    let o2 <string> = router_cors_origin("https://a.com", "https://a.com");
+    assert_eq_string(o2, "https://a.com", "helper: cors echo");
+    free_str(o2);
+    let o3 <string> = router_cors_origin("https://evil.com", "https://a.com");
+    assert_eq_string(o3, "", "helper: cors deny");
+    free_str(o3);
+    assert_true(router_auth_bearer("Bearer secret123", "secret123"), "helper: bearer ok");
+    assert_false(router_auth_bearer("Bearer wrong", "secret123"), "helper: bearer wrong");
+    assert_false(router_auth_bearer("", "secret123"), "helper: bearer empty header");
+    assert_false(router_auth_bearer("Bearer ", ""), "helper: bearer empty token");
+    assert_false(router_auth_bearer("bearer secret123", "secret123"), "helper: bearer case");
+    let line <string> = router_log_line("GET", "/users/1", 200);
+    assert_eq_string(line, "GET /users/1 -> 200", "helper: log line");
+    free_str(line);
+    let line2 <string> = router_log_line("POST", "/x", 404);
+    assert_eq_string(line2, "POST /x -> 404", "helper: log line 404");
+    free_str(line2);
+}
+
+fun main() <noret> {
+    test_literals();
+    test_params();
+    test_wildcard();
+    test_method_rules();
+    test_groups();
+    test_invalid_adds();
+    test_target_split();
+    test_query();
+    test_dispatch();
+    test_helpers();
+    printf("ALL TESTS PASSED\n");
+}

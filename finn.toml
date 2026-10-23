@@ -1,0 +1,14 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+[project]
+name = "fin-router"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "router.fin"
+
+[packages]
+# Until finn publishes it, zhttp is a sibling checkout passed to finc
+# with -I (see README.md); the library core itself has no dependency.
+
+[scripts]
+test = "finc -I src tests/test_router.fin -o test_router && ./test_router"
+smoke = "python3 tests/smoke.py"

@@ -1,0 +1,266 @@
+// router_server — example zhttp server built on fin-router (v0.1.0).
+//
+// Routes:
+//   GET  /                      -> "fin-router demo"
+//   GET  /users                 -> "user list"
+//   GET  /users/:id             -> "user <id>"
+//   POST /users                 -> 201, echoes the request body
+//   GET  /users/:id/posts/:pid  -> "user <id> post <pid>"
+//   GET  /files/*rest           -> "file <rest>"
+//   GET  /api/health            -> "ok"            (group /api)
+//   GET  /api/users/:id         -> "api user <id>" (group /api)
+//   GET  /admin/:section        -> "admin <section>", bearer-gated
+//
+// Middleware (registration order): request logger, then the auth gate
+// for /admin/*. CORS: every response carries
+// Access-Control-Allow-Origin (policy "*" here) via router_cors_origin.
+// 405 responses also carry an Allow header, taken from a router_match
+// call made before dispatch (dispatch itself returns only status/body).
+//
+// Build (from the repo root; zhttp is a sibling checkout until finn
+// publishes it):
+//   finc -I src -I <zhttp>/src examples/router_server.fin -o router_server
+// Run: ./router_server [port]   (default 8080)
+//   Port is argv[1] via /proc/self/cmdline (fin-ssg's recipe).
+//   Known stdlib caveat: Socket::serve lacks SO_REUSEADDR, so restart
+//   on the SAME port within ~60s of serving a client fails to bind —
+//   the smoke test uses a fresh port per run.
+
+import {
+    Router, RtCtx, RtResp, RtMwOut, RtMatch, RouteGroup,
+    router_new, router_add, router_group, group_add, router_use,
+    router_match, router_free_match, router_dispatch,
+    router_ctx_param, router_cors_origin, router_auth_bearer
+} from router::fin;
+import {
+    HttpRequest, HttpResponse, HttpReadResult, HttpServer, HttpConn,
+    http_listen, http_accept, http_read_request, http_write_response,
+    http_response_with_type, http_header_get, http_header_set,
+    http_free_response, http_free_read_result, http_close
+} from zhttp::fin;
+import { len, clone, concat, starts_with, free_str, to_chars, from_chars } from strings::std;
+
+// --- argv via Linux procfs (fin-ssg's recipe) -------------------------------
+
+#[llvm_name="open"]
+@define srv_open(path: string, flags: int) <int>;
+
+#[llvm_name="read"]
+@define srv_read(fd: int, buf: &char, count: ulong) <long>;
+
+#[llvm_name="close"]
+@define srv_close(fd: int) <int>;
+
+struct Argv { args <[string]>, count <int>, ok <bool> }
+
+fun read_argv() <Argv> {
+    let argv <Argv> = Argv{ args: new [string, 64]{}, count: 0, ok: false };
+    let buf <[char]> = new [char, 4096]{};
+    let fd <int> = srv_open("/proc/self/cmdline", 0);
+    if (fd < 0) { delete buf; return argv; }
+    let got <long> = srv_read(fd, &buf[0], cast<ulong>(4096));
+    srv_close(fd);
+    if (got <= cast<long>(0)) { delete buf; return argv; }
+    let end <int> = cast<int>(got);
+    let skip_first <bool> = true;
+    let start <int> = 0;
+    for (let i <int> = 0; i < end; i++) {
+        if (buf[i] == cast<char>(0)) {
+            if (i > start) {
+                if (skip_first) {
+                    skip_first = false;
+                } else if (argv.count < 64) {
+                    argv.args[argv.count] = from_chars(buf, start, i - start);
+                    argv.count = argv.count + 1;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    delete buf;
+    argv.ok = true;
+    return argv;
+}
+
+// --- handlers (all return FRESH bodies/content-types) ------------------------
+
+fun h_root(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone("fin-router demo\n"),
+                  content_type: clone("text/plain")};
+}
+
+fun h_users(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone("user list\n"),
+                  content_type: clone("text/plain")};
+}
+
+fun h_user(ctx: &RtCtx) <RtResp> {
+    let p1 <string> = clone("user ");
+    let p2 <string> = concat(p1, router_ctx_param(ctx, "id"));
+    free_str(p1);
+    let p3 <string> = concat(p2, "\n");
+    free_str(p2);
+    return RtResp{status: 200, body: p3, content_type: clone("text/plain")};
+}
+
+fun h_create(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 201, body: clone(ctx.body),
+                  content_type: clone("text/plain")};
+}
+
+fun h_post(ctx: &RtCtx) <RtResp> {
+    let p1 <string> = clone("user ");
+    let p2 <string> = concat(p1, router_ctx_param(ctx, "id"));
+    free_str(p1);
+    let p3 <string> = concat(p2, " post ");
+    free_str(p2);
+    let p4 <string> = concat(p3, router_ctx_param(ctx, "pid"));
+    free_str(p3);
+    let p5 <string> = concat(p4, "\n");
+    free_str(p4);
+    return RtResp{status: 200, body: p5, content_type: clone("text/plain")};
+}
+
+fun h_file(ctx: &RtCtx) <RtResp> {
+    let p1 <string> = clone("file ");
+    let p2 <string> = concat(p1, router_ctx_param(ctx, "rest"));
+    free_str(p1);
+    let p3 <string> = concat(p2, "\n");
+    free_str(p2);
+    return RtResp{status: 200, body: p3, content_type: clone("text/plain")};
+}
+
+fun h_health(ctx: &RtCtx) <RtResp> {
+    return RtResp{status: 200, body: clone("ok\n"),
+                  content_type: clone("text/plain")};
+}
+
+fun h_api_user(ctx: &RtCtx) <RtResp> {
+    let p1 <string> = clone("api user ");
+    let p2 <string> = concat(p1, router_ctx_param(ctx, "id"));
+    free_str(p1);
+    let p3 <string> = concat(p2, "\n");
+    free_str(p2);
+    return RtResp{status: 200, body: p3, content_type: clone("text/plain")};
+}
+
+fun h_admin(ctx: &RtCtx) <RtResp> {
+    let p1 <string> = clone("admin ");
+    let p2 <string> = concat(p1, router_ctx_param(ctx, "section"));
+    free_str(p1);
+    let p3 <string> = concat(p2, "\n");
+    free_str(p2);
+    return RtResp{status: 200, body: p3, content_type: clone("text/plain")};
+}
+
+// --- middleware ---------------------------------------------------------------
+
+// Logs every matched request to stdout. Middleware runs BEFORE the
+// handler, so it cannot know the outcome status — it logs method +
+// path only (router_log_line, with its "-> STATUS" suffix, is for
+// app code that logs after dispatch). Returns continue with fresh
+// empty strings.
+fun mw_log(ctx: &RtCtx) <RtMwOut> {
+    let p1 <string> = clone(ctx.method);
+    let p2 <string> = concat(p1, " ");
+    free_str(p1);
+    let p3 <string> = concat(p2, ctx.path);
+    free_str(p2);
+    printf("%s\n", p3);
+    free_str(p3);
+    return RtMwOut{stop: false, status: 0, body: clone(""),
+                   content_type: clone("")};
+}
+
+// --- wiring -----------------------------------------------------------------
+
+fun build_router() <&Router> {
+    let r <&Router> = router_new();
+    router_add(r, "GET", "/", h_root);
+    router_add(r, "GET", "/users", h_users);
+    router_add(r, "GET", "/users/:id", h_user);
+    router_add(r, "POST", "/users", h_create);
+    router_add(r, "GET", "/users/:id/posts/:pid", h_post);
+    router_add(r, "GET", "/files/*rest", h_file);
+    let api <&RouteGroup> = router_group(r, "/api");
+    group_add(api, "GET", "/health", h_health);
+    group_add(api, "GET", "/users/:id", h_api_user);
+    router_add(r, "GET", "/admin/:section", h_admin);
+    router_use(r, mw_log);
+    return r;
+}
+
+fun main() <noret> {
+    let argv <Argv> = read_argv();
+    let port <int> = 8080;
+    if (argv.count >= 1) {
+        // argv[0] here is the first user arg (argv[0] of the process
+        // was skipped by read_argv).
+        port = 8080;
+        let raw <string> = argv.args[0];
+        if (len(raw) > 0) {
+            // Parse a plain decimal port (no std int parser for
+            // argv; digits only, else keep the default).
+            let ok <bool> = true;
+            let v <int> = 0;
+            let chars <[char]> = to_chars(raw);
+            for (let i <int> = 0; i < len(raw); i++) {
+                let c <char> = chars[i];
+                if (c < '0' || c > '9') { ok = false; }
+                if (ok) { v = v * 10 + (cast<int>(c) - cast<int>('0')); }
+            }
+            delete chars;
+            if (ok && v > 0 && v < 65536) { port = v; }
+        }
+    }
+    let r <&Router> = build_router();
+    let srv <&HttpServer> = http_listen(port);
+    printf("router_server listening on %d\n", port);
+    while (true) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            let req <&HttpRequest> = rr.req;
+            // Match first (for the Allow header on 405s), then run
+            // the full pipeline.
+            let m <RtMatch> = router_match(r, req.method, req.target);
+            let resp <RtResp> = router_dispatch(r, req.method, req.target, req.body);
+            let http_resp <&HttpResponse> = http_response_with_type(resp.status, resp.content_type, resp.body);
+            // CORS on every response (policy "*" for the demo).
+            let origin <string> = http_header_get(req.headers, "Origin");
+            let cors <string> = router_cors_origin(origin, "*");
+            if (len(cors) > 0) {
+                http_header_set(http_resp.headers, "Access-Control-Allow-Origin", cors);
+            }
+            free_str(cors);
+            if (m.status == 405) {
+                http_header_set(http_resp.headers, "Allow", m.allow);
+            }
+            // Admin gate: the middleware chain above has no header
+            // access (ctx carries no headers — see README), so the
+            // bearer check for /admin/* lives here, in the app, and
+            // overrides the dispatch result. This is the documented
+            // pattern until ctx gains headers.
+            if (starts_with(req.target, "/admin")) {
+                let auth <string> = http_header_get(req.headers, "Authorization");
+                if (!router_auth_bearer(auth, "demo-token")) {
+                    http_free_response(http_resp);
+                    http_resp = http_response_with_type(401, "text/plain", "unauthorized\n");
+                    let cors2 <string> = router_cors_origin(origin, "*");
+                    if (len(cors2) > 0) {
+                        http_header_set(http_resp.headers, "Access-Control-Allow-Origin", cors2);
+                    }
+                    free_str(cors2);
+                }
+            }
+            http_write_response(conn, http_resp);
+            http_free_response(http_resp);
+            free_str(resp.body);
+            free_str(resp.content_type);
+            router_free_match(&m);
+            http_free_read_result(&rr);
+        }
+        http_close(conn);
+    }
+    return;
+}

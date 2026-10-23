@@ -1,0 +1,707 @@
+// fin-router — an HTTP router library for Fin (v0.1.0).
+//
+// Transport-independent by design (like fin-session's core): it knows
+// nothing about sockets or zhttp. It matches a method + target against
+// a registered route table, extracts path params and query values, and
+// dispatches to the registered handler fn. The zhttp wiring lives in
+// examples/router_server.fin; any other server can use the same core.
+//
+// Route patterns:
+//   "/users"            literal segments, exact match
+//   "/users/:id"        :name captures exactly one nonempty segment
+//   "/files/*rest"      trailing wildcard captures the rest, slashes
+//                       included (bare "*" captures under name "*")
+//   "/"                 the root route (zero segments)
+// Rules: patterns start with "/"; no empty segments (a trailing slash
+// is invalid); first registered match wins; method "*" matches any
+// method; matching is case-sensitive; the "?query" (and any "#frag")
+// is stripped before matching. router_add returns the route index,
+// or -1 for an invalid pattern/method.
+//
+// Handler and middleware functions are REAL Fin fn values stored in
+// the router (proven to lower through imports in finc 0.4.0 — see
+// NOTES.md): a handler is fn(&RtCtx) -> RtResp, middleware is
+// fn(&RtCtx) -> RtMwOut. Middleware runs AFTER a successful match,
+// in registration order, with full params in the ctx; 404/405
+// responses bypass middleware.
+//
+// OWNERSHIP (read this before freeing anything):
+// - The router clones every method/pattern it stores.
+// - router_match returns fresh param collections; free them with
+//   router_free_match. RtCtx borrows them: handlers must clone
+//   anything they keep past the call.
+// - RtResp bodies and content-types from router_dispatch are ALWAYS
+//   fresh: handlers MUST return fresh strings (clone literals), and
+//   the app frees resp.body / resp.content_type after writing.
+// - RtMwOut bodies/content-types must be fresh even when stop=false
+//   (dispatch frees them on continue, transfers them on stop).
+// - router_query_get, router_cors_origin, router_log_line,
+//   router_target_path, router_target_query return FRESH strings.
+// - router_param, router_route_method, router_route_pattern return
+//   BORROWED strings: never free them.
+
+import { Collection } from collection::std;
+import {
+    len, equals, clone, concat, substr, starts_with, ends_with, find, split,
+    join, free_str, to_chars, from_chars
+} from strings::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// Request context handed to handlers and middleware. Every string here
+// is BORROWED for the duration of the call (method/path/query/body from
+// the caller, params from the match frame) — clone to keep.
+#[export]
+pub struct RtCtx {
+    pub:
+        method <string>,
+        path <string>,
+        query <string>,
+        body <string>,
+        names <&Collection<string>>,
+        values <&Collection<string>>,
+}
+
+// Handler result. body and content_type MUST be fresh (clone literals).
+#[export]
+pub struct RtResp {
+    pub:
+        status <int>,
+        body <string>,
+        content_type <string>,
+}
+
+// Middleware result. stop=false means "continue to the next middleware
+// / handler"; stop=true short-circuits dispatch with this status/body.
+// body and content_type MUST be fresh even when stop=false.
+#[export]
+pub struct RtMwOut {
+    pub:
+        stop <bool>,
+        status <int>,
+        body <string>,
+        content_type <string>,
+}
+
+// Match result. found=false means status is 404 (no path match) or 405
+// (path matched under other methods; those are in allow, comma-joined).
+// names/values are FRESH parallel collections; free with
+// router_free_match. index is -1 when not found.
+#[export]
+pub struct RtMatch {
+    pub:
+        found <bool>,
+        status <int>,
+        index <int>,
+        allow <string>,
+        names <&Collection<string>>,
+        values <&Collection<string>>,
+}
+
+// The route table: parallel collections (methods[i], patterns[i],
+// handlers[i] belong together). A Collection<struct> would need struct
+// ==, which the backend refuses — hence this shape (same as zhttp's
+// HttpHeaders and finconfig's Cfg).
+#[export]
+pub struct Router {
+    pub:
+        methods <&Collection<string>>,
+        patterns <&Collection<string>>,
+        handlers <&Collection<fn(&RtCtx) -> RtResp>>,
+        mws <&Collection<fn(&RtCtx) -> RtMwOut>>,
+}
+
+// A group prefixes every route added through it. prefix is owned
+// (cloned) by the group; free with group_free.
+#[export]
+pub struct RouteGroup {
+    pub:
+        router <&Router>,
+        prefix <string>,
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers (module-private)
+// ---------------------------------------------------------------------------
+
+fun rt_is_hex(c: char) <bool> {
+    if (c >= '0' && c <= '9') { return true; }
+    if (c >= 'a' && c <= 'f') { return true; }
+    if (c >= 'A' && c <= 'F') { return true; }
+    return false;
+}
+
+fun rt_hex_val(c: char) <int> {
+    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0'); }
+    if (c >= 'a' && c <= 'f') { return cast<int>(c) - cast<int>('a') + 10; }
+    return cast<int>(c) - cast<int>('A') + 10;
+}
+
+// Percent-decode. plus_space=true turns '+' into ' ' (query values);
+// false leaves '+' literal (path params). Returns a FRESH string.
+// A '%' not followed by two hex digits is left literal. "%00" decodes
+// to NUL and truncates the value (C-string semantics).
+fun rt_pct_decode(s: string, plus_space: bool) <string> {
+    let raw <[char]> = to_chars(s);
+    let n <int> = len(s);
+    let out <[char]> = new [char, n + 1]{};
+    let w <int> = 0;
+    let i <int> = 0;
+    while (i < n) {
+        let c <char> = raw[i];
+        if (c == '%' && i + 2 < n && rt_is_hex(raw[i + 1]) && rt_is_hex(raw[i + 2])) {
+            out[w] = cast<char>(rt_hex_val(raw[i + 1]) * 16 + rt_hex_val(raw[i + 2]));
+            w = w + 1;
+            i = i + 3;
+        } else {
+            if (c == '+' && plus_space) { out[w] = ' '; } else { out[w] = c; }
+            w = w + 1;
+            i = i + 1;
+        }
+    }
+    delete raw;
+    let res <string> = from_chars(out, 0, w);
+    delete out;
+    return res;
+}
+
+// Integer to decimal string (zhttp's calloc + snprintf pattern).
+#[llvm_name="calloc"]
+@define rt_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define rt_cfree(p: string) <noret>;
+
+#[llvm_name="snprintf"]
+@define rt_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+
+fun rt_itoa(v: int) <string> {
+    let tmp <string> = rt_calloc(cast<ulong>(24), cast<ulong>(1));
+    rt_snprintf(tmp, cast<ulong>(24), "%d", v);
+    let out <string> = clone(tmp);
+    rt_cfree(tmp);
+    return out;
+}
+
+fun rt_free_str_coll(c: &Collection<string>) <noret> {
+    let n <int> = c.len();
+    for (let i <int> = 0; i < n; i++) {
+        free_str(c.get(i));
+    }
+    delete c;
+}
+
+// Split an absolute path into segments. "/" -> zero segments.
+// "/users/42" -> ["users", "42"]. Fresh strings, fresh collection.
+fun rt_split_segments(path: string) <&Collection<string>> {
+    let parts <&Collection<string>> = new Collection::<string>{};
+    if (equals(path, "/")) { return parts; }
+    let all <&Collection<string>> = split(path, '/');
+    let n <int> = all.len();
+    // Element 0 is "" (the leading slash); the rest are the segments.
+    for (let i <int> = 1; i < n; i++) {
+        parts.push(all.get(i));
+    }
+    delete all;
+    return parts;
+}
+
+// Is `seg` a wildcard segment (starts with '*')? Name is the rest,
+// or "*" when bare.
+fun rt_seg_is_wild(seg: string) <bool> {
+    return starts_with(seg, "*");
+}
+
+fun rt_seg_is_param(seg: string) <bool> {
+    return starts_with(seg, ":");
+}
+
+// Validate a pattern: starts with "/", no empty segments, wildcard
+// only as the last segment, param names nonempty.
+fun rt_pattern_ok(pattern: string) <bool> {
+    if (!starts_with(pattern, "/")) { return false; }
+    if (equals(pattern, "/")) { return true; }
+    let segs <&Collection<string>> = rt_split_segments(pattern);
+    let n <int> = segs.len();
+    let ok <bool> = true;
+    for (let i <int> = 0; i < n; i++) {
+        let seg <string> = segs.get(i);
+        if (len(seg) == 0) { ok = false; }
+        if (rt_seg_is_wild(seg) && i + 1 < n) { ok = false; }
+        if (rt_seg_is_param(seg) && len(seg) < 2) { ok = false; }
+    }
+    rt_free_str_coll(segs);
+    return ok;
+}
+
+// Try to match pattern segments against path segments. On success,
+// appends cloned (decoded) param names/values to names_out/values_out
+// and returns true. On failure the out-collections are untouched
+// except for entries appended before the failing segment — callers
+// pass throwaway collections and free them on failure.
+fun rt_match_segments(psegs: &Collection<string>, segs: &Collection<string>,
+                      names_out: &Collection<string>,
+                      values_out: &Collection<string>) <bool> {
+    let np <int> = psegs.len();
+    let ns <int> = segs.len();
+    let wild <bool> = false;
+    if (np > 0 && rt_seg_is_wild(psegs.get(np - 1))) { wild = true; }
+    if (wild) {
+        if (ns < np - 1) { return false; }
+    } else {
+        if (ns != np) { return false; }
+    }
+    for (let i <int> = 0; i < np; i++) {
+        let p <string> = psegs.get(i);
+        if (rt_seg_is_wild(p)) {
+            let nm <string> = "*";
+            if (len(p) > 1) { nm = substr(p, 1, len(p) - 1); }
+            // Join the remaining path segments with "/".
+            let rest <string> = clone("");
+            for (let j <int> = i; j < ns; j++) {
+                if (j > i) {
+                    let old <string> = rest;
+                    rest = concat(old, "/");
+                    free_str(old);
+                }
+                let old2 <string> = rest;
+                rest = concat(old2, segs.get(j));
+                free_str(old2);
+            }
+            names_out.push(clone(nm));
+            values_out.push(rt_pct_decode(rest, false));
+            free_str(rest);
+            if (len(p) > 1) { free_str(nm); }
+            return true;
+        }
+        let s <string> = segs.get(i);
+        if (rt_seg_is_param(p)) {
+            if (len(s) == 0) { return false; }
+            let nm <string> = substr(p, 1, len(p) - 1);
+            names_out.push(nm);
+            values_out.push(rt_pct_decode(s, false));
+        } else {
+            if (!equals(p, s)) { return false; }
+        }
+    }
+    return true;
+}
+
+// Join a group prefix with a pattern. Pattern "/" maps to the prefix
+// itself (so a group's root route is the prefix, not prefix + "/").
+fun rt_join_prefix(prefix: string, pattern: string) <string> {
+    if (equals(pattern, "/")) { return clone(prefix); }
+    if (ends_with(prefix, "/")) {
+        let trimmed <string> = substr(prefix, 0, len(prefix) - 1);
+        let res <string> = concat(trimmed, pattern);
+        free_str(trimmed);
+        return res;
+    }
+    return concat(prefix, pattern);
+}
+
+// ---------------------------------------------------------------------------
+// Router lifecycle
+// ---------------------------------------------------------------------------
+
+#[export]
+pub fun router_new() <&Router> {
+    return new Router{methods: new Collection::<string>{},
+                      patterns: new Collection::<string>{},
+                      handlers: new Collection::<fn(&RtCtx) -> RtResp>{},
+                      mws: new Collection::<fn(&RtCtx) -> RtMwOut>{}};
+}
+
+#[export]
+pub fun router_free(r: &Router) <noret> {
+    if (r == null) { return; }
+    rt_free_str_coll(r.methods);
+    rt_free_str_coll(r.patterns);
+    delete r.handlers;
+    delete r.mws;
+    delete r;
+}
+
+#[export]
+pub fun router_count(r: &Router) <int> {
+    return r.methods.len();
+}
+
+// Borrowed: never free the result.
+#[export]
+pub fun router_route_method(r: &Router, i: int) <string> {
+    return r.methods.get(i);
+}
+
+// Borrowed: never free the result.
+#[export]
+pub fun router_route_pattern(r: &Router, i: int) <string> {
+    return r.patterns.get(i);
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+// Register a route. Returns its index, or -1 for an invalid pattern
+// (not starting with "/", empty segment, wildcard not last, empty
+// param name) or an empty method. First registered match wins.
+#[export]
+pub fun router_add(r: &Router, method: string, pattern: string,
+                   handler: fn(&RtCtx) -> RtResp) <int> {
+    if (len(method) == 0) { return 0 - 1; }
+    if (!rt_pattern_ok(pattern)) { return 0 - 1; }
+    r.methods.push(clone(method));
+    r.patterns.push(clone(pattern));
+    r.handlers.push(handler);
+    return r.methods.len() - 1;
+}
+
+#[export]
+pub fun router_group(r: &Router, prefix: string) <&RouteGroup> {
+    return new RouteGroup{router: r, prefix: clone(prefix)};
+}
+
+#[export]
+pub fun group_free(g: &RouteGroup) <noret> {
+    if (g == null) { return; }
+    free_str(g.prefix);
+    delete g;
+}
+
+#[export]
+pub fun group_add(g: &RouteGroup, method: string, pattern: string,
+                  handler: fn(&RtCtx) -> RtResp) <int> {
+    let joined <string> = rt_join_prefix(g.prefix, pattern);
+    let idx <int> = router_add(g.router, method, joined, handler);
+    free_str(joined);
+    return idx;
+}
+
+#[export]
+pub fun router_use(r: &Router, mw: fn(&RtCtx) -> RtMwOut) <noret> {
+    r.mws.push(mw);
+}
+
+// ---------------------------------------------------------------------------
+// Target splitting (fresh strings; caller frees)
+// ---------------------------------------------------------------------------
+
+// Path part of a target: everything before the first '?' (and before
+// any '#' fragment). "/users/42?tab=posts" -> "/users/42".
+#[export]
+pub fun router_target_path(target: string) <string> {
+    let q <int> = find(target, "?");
+    let path <string> = target;
+    if (q >= 0) { path = substr(target, 0, q); } else { path = clone(target); }
+    let h <int> = find(path, "#");
+    if (h >= 0) {
+        let cut <string> = substr(path, 0, h);
+        free_str(path);
+        return cut;
+    }
+    return path;
+}
+
+// Raw query part of a target ("" when none, no '?' included, no
+// decoding — use router_query_get for decoded values).
+#[export]
+pub fun router_target_query(target: string) <string> {
+    let q <int> = find(target, "?");
+    if (q < 0) { return clone(""); }
+    let rest <string> = substr(target, q + 1, len(target) - q - 1);
+    let h <int> = find(rest, "#");
+    if (h >= 0) {
+        let cut <string> = substr(rest, 0, h);
+        free_str(rest);
+        return cut;
+    }
+    return rest;
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+// Match a method + target against the table. First registered match
+// wins. A route whose method is "*" matches any method. When the path
+// matches but no method does, status is 405 and allow lists the
+// methods registered for that path (deduped, registration order).
+#[export]
+pub fun router_match(r: &Router, method: string, target: string) <RtMatch> {
+    let path <string> = router_target_path(target);
+    let segs <&Collection<string>> = rt_split_segments(path);
+    free_str(path);
+    let names <&Collection<string>> = new Collection::<string>{};
+    let values <&Collection<string>> = new Collection::<string>{};
+    let allow <&Collection<string>> = new Collection::<string>{};
+    let found <bool> = false;
+    let idx <int> = 0 - 1;
+    let n <int> = r.methods.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (found) { break; }
+        let psegs <&Collection<string>> = rt_split_segments(r.patterns.get(i));
+        let tn <&Collection<string>> = new Collection::<string>{};
+        let tv <&Collection<string>> = new Collection::<string>{};
+        if (rt_match_segments(psegs, segs, tn, tv)) {
+            let rm <string> = r.methods.get(i);
+            if (equals(rm, method) || equals(rm, "*")) {
+                found = true;
+                idx = i;
+                delete names;
+                delete values;
+                names = tn;
+                values = tv;
+            } else {
+                // Path matched under another method: record it once.
+                let seen <bool> = false;
+                let an <int> = allow.len();
+                for (let a <int> = 0; a < an; a++) {
+                    if (equals(allow.get(a), rm)) { seen = true; }
+                }
+                if (!seen) { allow.push(clone(rm)); }
+                rt_free_str_coll(tn);
+                rt_free_str_coll(tv);
+            }
+        } else {
+            rt_free_str_coll(tn);
+            rt_free_str_coll(tv);
+        }
+        rt_free_str_coll(psegs);
+    }
+    rt_free_str_coll(segs);
+    let status <int> = 404;
+    let allow_s <string> = clone("");
+    if (found) {
+        status = 200;
+    } else if (allow.len() > 0) {
+        status = 405;
+        allow_s = join(allow, ", ");
+    }
+    rt_free_str_coll(allow);
+    return RtMatch{found: found, status: status, index: idx, allow: allow_s,
+                   names: names, values: values};
+}
+
+// Free a match result: its allow string and its param collections.
+// The match struct itself is a value; nothing else to free.
+#[export]
+pub fun router_free_match(m: &RtMatch) <noret> {
+    free_str(m.allow);
+    rt_free_str_coll(m.names);
+    rt_free_str_coll(m.values);
+}
+
+// Param lookup on a match (or on a ctx's names/values via the same
+// shape — see router_param_ctx below). Borrowed: never free.
+#[export]
+pub fun router_param(m: &RtMatch, name: string) <string> {
+    let n <int> = m.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(m.names.get(i), name)) { return m.values.get(i); }
+    }
+    return "";
+}
+
+#[export]
+pub fun router_param_has(m: &RtMatch, name: string) <bool> {
+    let n <int> = m.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(m.names.get(i), name)) { return true; }
+    }
+    return false;
+}
+
+#[export]
+pub fun router_param_count(m: &RtMatch) <int> {
+    return m.names.len();
+}
+
+#[export]
+pub fun router_param_name(m: &RtMatch, i: int) <string> {
+    return m.names.get(i);
+}
+
+#[export]
+pub fun router_param_value(m: &RtMatch, i: int) <string> {
+    return m.values.get(i);
+}
+
+// Param lookup directly on a handler ctx (same parallel collections).
+// Borrowed: never free.
+#[export]
+pub fun router_ctx_param(ctx: &RtCtx, name: string) <string> {
+    let n <int> = ctx.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ctx.names.get(i), name)) { return ctx.values.get(i); }
+    }
+    return "";
+}
+
+#[export]
+pub fun router_ctx_param_has(ctx: &RtCtx, name: string) <bool> {
+    let n <int> = ctx.names.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ctx.names.get(i), name)) { return true; }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Query values (fresh decoded strings; caller frees)
+// ---------------------------------------------------------------------------
+
+// First value for `key` in a raw query string ("a=1&b=2"), %-decoded
+// with '+' -> space. A bare key ("flag") counts as present with
+// value "". Missing key -> fresh "" (free it like any other result).
+#[export]
+pub fun router_query_get(query: string, key: string) <string> {
+    let parts <&Collection<string>> = split(query, '&');
+    let n <int> = parts.len();
+    let out <string> = clone("");
+    let done <bool> = false;
+    for (let i <int> = 0; i < n; i++) {
+        if (done) { break; }
+        let pair <string> = parts.get(i);
+        let eq <int> = find(pair, "=");
+        let nm <string> = pair;
+        let val <string> = clone("");
+        if (eq >= 0) {
+            nm = substr(pair, 0, eq);
+            val = substr(pair, eq + 1, len(pair) - eq - 1);
+        }
+        let dec_nm <string> = rt_pct_decode(nm, true);
+        if (eq >= 0) { free_str(nm); }
+        if (equals(dec_nm, key)) {
+            let dec_val <string> = rt_pct_decode(val, true);
+            free_str(val);
+            free_str(out);
+            out = dec_val;
+            done = true;
+        } else {
+            free_str(val);
+        }
+        free_str(dec_nm);
+    }
+    rt_free_str_coll(parts);
+    return out;
+}
+
+#[export]
+pub fun router_query_has(query: string, key: string) <bool> {
+    let parts <&Collection<string>> = split(query, '&');
+    let n <int> = parts.len();
+    let has <bool> = false;
+    for (let i <int> = 0; i < n; i++) {
+        if (has) { break; }
+        let pair <string> = parts.get(i);
+        let eq <int> = find(pair, "=");
+        let nm <string> = pair;
+        if (eq >= 0) { nm = substr(pair, 0, eq); }
+        let dec_nm <string> = rt_pct_decode(nm, true);
+        if (eq >= 0) { free_str(nm); }
+        if (equals(dec_nm, key)) { has = true; }
+        free_str(dec_nm);
+    }
+    rt_free_str_coll(parts);
+    return has;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch: match -> middleware (in order) -> handler
+// ---------------------------------------------------------------------------
+
+// Full pipeline for one request. The returned RtResp body and
+// content_type are ALWAYS fresh: free them after writing the response.
+// 404/405 bodies are "not found\n" / "method not allowed\n"
+// (text/plain); a middleware short-circuit returns the middleware's
+// own status/body/content_type.
+#[export]
+pub fun router_dispatch(r: &Router, method: string, target: string,
+                        body: string) <RtResp> {
+    let m <RtMatch> = router_match(r, method, target);
+    if (!m.found) {
+        let st <int> = m.status;
+        let b <string> = clone("not found\n");
+        if (st == 405) {
+            free_str(b);
+            b = clone("method not allowed\n");
+        }
+        router_free_match(&m);
+        return RtResp{status: st, body: b, content_type: clone("text/plain")};
+    }
+    let path <string> = router_target_path(target);
+    let query <string> = router_target_query(target);
+    let ctx <RtCtx> = RtCtx{method: method, path: path, query: query, body: body,
+                            names: m.names, values: m.values};
+    let nmw <int> = r.mws.len();
+    for (let i <int> = 0; i < nmw; i++) {
+        let mw <fn(&RtCtx) -> RtMwOut> = r.mws.get(i);
+        let o <RtMwOut> = mw(&ctx);
+        if (o.stop) {
+            free_str(path);
+            free_str(query);
+            router_free_match(&m);
+            return RtResp{status: o.status, body: o.body,
+                          content_type: o.content_type};
+        }
+        free_str(o.body);
+        free_str(o.content_type);
+    }
+    let h <fn(&RtCtx) -> RtResp> = r.handlers.get(m.index);
+    let resp <RtResp> = h(&ctx);
+    free_str(path);
+    free_str(query);
+    router_free_match(&m);
+    return resp;
+}
+
+// ---------------------------------------------------------------------------
+// Middleware helpers (transport-independent building blocks)
+// ---------------------------------------------------------------------------
+
+// CORS origin to echo: "*" when the policy allows any origin, the
+// request origin when it matches the allowed origin, else "" (no CORS
+// header). Fresh string; caller frees.
+#[export]
+pub fun router_cors_origin(origin: string, allowed: string) <string> {
+    if (equals(allowed, "*")) { return clone("*"); }
+    if (equals(origin, allowed)) { return clone(origin); }
+    return clone("");
+}
+
+// Bearer-token check: true iff header is exactly "Bearer <token>".
+// Empty token never matches (an empty Authorization header is not
+// "Bearer ").
+#[export]
+pub fun router_auth_bearer(auth_header: string, token: string) <bool> {
+    if (len(token) == 0) { return false; }
+    let want <string> = concat("Bearer ", token);
+    let ok <bool> = equals(auth_header, want);
+    free_str(want);
+    return ok;
+}
+
+// One log line for a request: "METHOD path -> STATUS". Fresh string.
+#[export]
+pub fun router_log_line(method: string, path: string, status: int) <string> {
+    let st <string> = rt_itoa(status);
+    let line <string> = concat(method, " ");
+    let old1 <string> = line;
+    line = concat(old1, path);
+    free_str(old1);
+    let old2 <string> = line;
+    line = concat(old2, " -> ");
+    free_str(old2);
+    let old3 <string> = line;
+    line = concat(old3, st);
+    free_str(old3);
+    free_str(st);
+    return line;
+}
+
+}
